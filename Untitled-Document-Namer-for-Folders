@@ -1,0 +1,1637 @@
+/**
+ * SMART GOOGLE DOC RENAMER — NO API KEY REQUIRED
+ *
+ * Features:
+ * 1. Checks Google Docs inside one Drive folder.
+ * 2. Documents with fewer than 2 words are named:
+ *    "less than 2 words"
+ * 3. For untitled or generically named documents, it first looks
+ *    for a real title or heading inside the document.
+ * 4. If no title is found, it analyzes sentences and repeated
+ *    keywords to create a descriptive filename.
+ * 5. Generated filenames are expanded to use more of the visible
+ *    Google Drive filename area.
+ * 6. Preview mode shows suggestions without renaming anything.
+ */
+
+const SETTINGS = {
+  // Paste your Google Drive folder link here.
+  FOLDER_URL: 'PASTE_YOUR_GOOGLE_DRIVE_FOLDER_URL_HERE',
+
+  // true = show suggested filenames without changing anything
+  // false = actually rename the files
+  PREVIEW_ONLY: true,
+
+  // Maximum number of Google Docs checked in one run.
+  MAX_FILES: 50,
+
+  // Maximum amount of text read from each document.
+  MAX_DOCUMENT_CHARACTERS: 40000,
+
+  // Generated titles will try to reach approximately this length.
+  TARGET_TITLE_CHARACTERS: 75,
+
+  // A generated filename will never exceed this length.
+  MAX_TITLE_CHARACTERS: 110,
+
+  // Maximum words allowed in a generated filename.
+  MAX_TITLE_WORDS: 18,
+
+  // Only rename generically named files, except for the
+  // special fewer-than-two-words rule.
+  ONLY_RENAME_GENERIC_FILES: true,
+
+  // Exact filename used for empty or one-word documents.
+  LESS_THAN_TWO_WORDS_TITLE: 'less than 2 words'
+};
+
+
+/**
+ * SELECT AND RUN THIS FUNCTION.
+ */
+function runSmartDocumentRenamer() {
+  const folderId = extractFolderId_(SETTINGS.FOLDER_URL);
+  const folder = DriveApp.getFolderById(folderId);
+  const files = folder.getFilesByType(MimeType.GOOGLE_DOCS);
+
+  let checkedCount = 0;
+  let analyzedCount = 0;
+  let renamedCount = 0;
+  let previewCount = 0;
+  let skippedCount = 0;
+
+  console.log('SMART GOOGLE DOC RENAMER');
+  console.log('Folder: ' + folder.getName());
+  console.log('Preview only: ' + SETTINGS.PREVIEW_ONLY);
+  console.log('----------------------------------------');
+
+  while (files.hasNext() && checkedCount < SETTINGS.MAX_FILES) {
+    const file = files.next();
+    checkedCount++;
+
+    try {
+      const currentTitle = file.getName();
+      const documentData = readDocumentData_(file.getId());
+      const wordCount = countWords_(documentData.fullText);
+
+      /*
+       * Special rule:
+       * Every document with zero or one word is named
+       * "less than 2 words", regardless of its current filename.
+       */
+      if (wordCount < 2) {
+        analyzedCount++;
+
+        console.log('CURRENT FILE NAME: ' + currentTitle);
+        console.log('DOCUMENT WORD COUNT: ' + wordCount);
+        console.log(
+          'PROPOSED FILE NAME: ' +
+          SETTINGS.LESS_THAN_TWO_WORDS_TITLE
+        );
+        console.log(
+          'TITLE METHOD: Document contains fewer than 2 words'
+        );
+        console.log('DOCUMENT LINK: ' + file.getUrl());
+
+        const shortDocumentResult = applyOrPreviewRename_(
+          file,
+          currentTitle,
+          SETTINGS.LESS_THAN_TWO_WORDS_TITLE
+        );
+
+        if (shortDocumentResult === 'renamed') {
+          renamedCount++;
+        } else if (shortDocumentResult === 'preview') {
+          previewCount++;
+        } else {
+          skippedCount++;
+        }
+
+        console.log('----------------------------------------');
+        continue;
+      }
+
+      /*
+       * For documents with at least two words, skip filenames
+       * that are already specific when this option is enabled.
+       */
+      if (
+        SETTINGS.ONLY_RENAME_GENERIC_FILES &&
+        !isGenericFileName_(currentTitle)
+      ) {
+        console.log('SKIPPED: ' + currentTitle);
+        console.log(
+          'Reason: The file already has a specific filename.'
+        );
+        console.log('----------------------------------------');
+
+        skippedCount++;
+        continue;
+      }
+
+      analyzedCount++;
+
+      const analysis = analyzeDocument_(documentData);
+      const proposedTitle = cleanTitle_(analysis.title);
+
+      console.log('CURRENT FILE NAME: ' + currentTitle);
+      console.log('DOCUMENT WORD COUNT: ' + wordCount);
+      console.log('PROPOSED FILE NAME: ' + proposedTitle);
+      console.log('SUMMARY: ' + analysis.summary);
+      console.log('TITLE METHOD: ' + analysis.method);
+      console.log('DOCUMENT LINK: ' + file.getUrl());
+
+      const result = applyOrPreviewRename_(
+        file,
+        currentTitle,
+        proposedTitle
+      );
+
+      if (result === 'renamed') {
+        renamedCount++;
+      } else if (result === 'preview') {
+        previewCount++;
+      } else {
+        skippedCount++;
+      }
+
+      console.log('----------------------------------------');
+
+    } catch (error) {
+      console.log('ERROR WITH FILE: ' + file.getName());
+      console.log(error.message || String(error));
+      console.log('----------------------------------------');
+
+      skippedCount++;
+    }
+  }
+
+  console.log('FINISHED');
+  console.log('Files checked: ' + checkedCount);
+  console.log('Files analyzed: ' + analyzedCount);
+  console.log('Preview suggestions: ' + previewCount);
+  console.log('Files renamed: ' + renamedCount);
+  console.log('Files skipped or unchanged: ' + skippedCount);
+
+  if (SETTINGS.PREVIEW_ONLY) {
+    console.log(
+      'No files were renamed because PREVIEW_ONLY is true.'
+    );
+  }
+}
+
+
+/**
+ * Previews or performs a filename change.
+ */
+function applyOrPreviewRename_(file, currentTitle, proposedTitle) {
+  if (
+    currentTitle.toLowerCase().trim() ===
+    proposedTitle.toLowerCase().trim()
+  ) {
+    console.log(
+      'RESULT: The file already has the correct filename.'
+    );
+
+    return 'unchanged';
+  }
+
+  if (SETTINGS.PREVIEW_ONLY) {
+    console.log(
+      'RESULT: Preview only — the file was not renamed.'
+    );
+
+    return 'preview';
+  }
+
+  file.setName(proposedTitle);
+  console.log('RESULT: File successfully renamed.');
+
+  return 'renamed';
+}
+
+
+/**
+ * Reads text and paragraph information from a Google Doc.
+ */
+function readDocumentData_(documentId) {
+  const document = DocumentApp.openById(documentId);
+  const textSections = [];
+  const paragraphs = [];
+
+  /*
+   * Newer Google Docs can contain multiple tabs.
+   * This reads every tab when tab support is available.
+   */
+  if (typeof document.getTabs === 'function') {
+    const tabs = document.getTabs();
+
+    tabs.forEach(function(tab) {
+      collectTabData_(tab, textSections, paragraphs);
+    });
+  } else {
+    /*
+     * Fallback for documents or accounts without tab support.
+     */
+    const body = document.getBody();
+    collectBodyData_(body, 'Main document', textSections, paragraphs);
+  }
+
+  return {
+    fullText: textSections
+      .join('\n')
+      .slice(0, SETTINGS.MAX_DOCUMENT_CHARACTERS)
+      .trim(),
+
+    paragraphs: paragraphs
+  };
+}
+
+
+/**
+ * Reads one document tab and its child tabs.
+ */
+function collectTabData_(tab, textSections, paragraphs) {
+  try {
+    const documentTab = tab.asDocumentTab();
+    const body = documentTab.getBody();
+
+    collectBodyData_(
+      body,
+      typeof tab.getTitle === 'function' ?
+        tab.getTitle() :
+        'Document tab',
+      textSections,
+      paragraphs
+    );
+
+  } catch (error) {
+    console.log(
+      'Could not read one document tab: ' +
+      (error.message || String(error))
+    );
+  }
+
+  if (typeof tab.getChildTabs === 'function') {
+    tab.getChildTabs().forEach(function(childTab) {
+      collectTabData_(childTab, textSections, paragraphs);
+    });
+  }
+}
+
+
+/**
+ * Reads text and paragraphs from one document body.
+ */
+function collectBodyData_(
+  body,
+  tabTitle,
+  textSections,
+  paragraphs
+) {
+  const bodyText = body.getText().trim();
+
+  if (bodyText) {
+    textSections.push(bodyText);
+  }
+
+  body.getParagraphs().forEach(function(paragraph) {
+    const text = paragraph
+      .getText()
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!text) {
+      return;
+    }
+
+    paragraphs.push({
+      text: text,
+      heading: String(paragraph.getHeading()),
+      position: paragraphs.length,
+      tabTitle: tabTitle
+    });
+  });
+}
+
+
+/**
+ * Selects an existing document title or creates a new title.
+ */
+function analyzeDocument_(documentData) {
+  const explicitTitle = findExplicitTitle_(
+    documentData.paragraphs
+  );
+
+  const summary = createDocumentSummary_(
+    documentData.fullText
+  );
+
+  /*
+   * If the document already contains a real title, use that
+   * title without adding unnecessary keywords.
+   */
+  if (explicitTitle) {
+    return {
+      title: explicitTitle,
+      summary: summary,
+      method: 'Existing title or heading inside document'
+    };
+  }
+
+  /*
+   * Otherwise, determine the main idea and create a longer,
+   * descriptive filename.
+   */
+  const baseTitle = generateMainIdeaTitle_(
+    documentData.fullText
+  );
+
+  const expandedTitle = expandGeneratedTitle_(
+    baseTitle,
+    documentData.fullText
+  );
+
+  return {
+    title: expandedTitle,
+    summary: summary,
+    method: 'Main idea, sentence, and keyword analysis'
+  };
+}
+
+
+/**
+ * Looks for an actual title or heading near the top.
+ */
+function findExplicitTitle_(paragraphs) {
+  const beginningParagraphs = paragraphs.slice(0, 20);
+
+  /*
+   * First preference:
+   * Text formatted as Title, Subtitle, Heading 1, or Heading 2.
+   */
+  for (
+    let index = 0;
+    index < beginningParagraphs.length;
+    index++
+  ) {
+    const paragraph = beginningParagraphs[index];
+
+    if (
+      isTitleHeadingStyle_(paragraph.heading) &&
+      isSuitableExistingTitle_(paragraph.text)
+    ) {
+      return formatExistingTitle_(paragraph.text);
+    }
+  }
+
+  /*
+   * Second preference:
+   * A short, title-like line among the first eight paragraphs.
+   */
+  const firstLines = beginningParagraphs.slice(0, 8);
+
+  for (let index = 0; index < firstLines.length; index++) {
+    const candidate = firstLines[index].text;
+
+    if (isSuitableExistingTitle_(candidate)) {
+      return formatExistingTitle_(candidate);
+    }
+  }
+
+  return '';
+}
+
+
+/**
+ * Determines whether a paragraph has a title-like style.
+ */
+function isTitleHeadingStyle_(heading) {
+  const value = String(heading || '').toUpperCase();
+
+  return (
+    value.indexOf('TITLE') !== -1 ||
+    value.indexOf('SUBTITLE') !== -1 ||
+    value.indexOf('HEADING1') !== -1 ||
+    value.indexOf('HEADING_1') !== -1 ||
+    value.indexOf('HEADING2') !== -1 ||
+    value.indexOf('HEADING_2') !== -1
+  );
+}
+
+
+/**
+ * Determines whether text is suitable as an existing title.
+ */
+function isSuitableExistingTitle_(text) {
+  const value = String(text || '').trim();
+  const wordCount = countWords_(value);
+
+  if (
+    value.length < 5 ||
+    value.length > SETTINGS.MAX_TITLE_CHARACTERS ||
+    wordCount < 2 ||
+    wordCount > 14
+  ) {
+    return false;
+  }
+
+  if (
+    isGenericText_(value) ||
+    looksLikePersonalInformation_(value) ||
+    looksLikeQuestionOrInstruction_(value)
+  ) {
+    return false;
+  }
+
+  /*
+   * Longer text ending in sentence punctuation is probably
+   * body text rather than a document title.
+   */
+  if (
+    wordCount > 8 &&
+    /[.!?]$/.test(value)
+  ) {
+    return false;
+  }
+
+  /*
+   * First-person statements are usually body text.
+   */
+  if (
+    /^(i|we|my family|our family)\s+(went|was|were|am|had|have|did|decided|started|learned)\b/i
+      .test(value)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+
+/**
+ * Creates an extractive summary from important sentences.
+ */
+function createDocumentSummary_(text) {
+  const normalizedText = normalizeText_(text);
+  const sentences = splitIntoSentences_(normalizedText);
+
+  if (!sentences.length) {
+    return shortenText_(normalizedText, 350);
+  }
+
+  const frequencies = calculateWordFrequencies_(
+    normalizedText
+  );
+
+  const rankedSentences = sentences
+    .map(function(sentence, index) {
+      return {
+        sentence: sentence,
+        index: index,
+        score: scoreSentence_(
+          sentence,
+          index,
+          frequencies
+        )
+      };
+    })
+    .sort(function(first, second) {
+      return second.score - first.score;
+    });
+
+  const selectedSentences = rankedSentences
+    .slice(0, 2)
+    .sort(function(first, second) {
+      return first.index - second.index;
+    })
+    .map(function(item) {
+      return item.sentence;
+    });
+
+  return shortenText_(
+    selectedSentences.join(' '),
+    350
+  );
+}
+
+
+/**
+ * Creates a short base title from the document's main idea.
+ */
+function generateMainIdeaTitle_(text) {
+  const normalizedText = normalizeText_(text);
+  const sentences = splitIntoSentences_(normalizedText);
+  const frequencies = calculateWordFrequencies_(
+    normalizedText
+  );
+
+  if (!sentences.length) {
+    return generateKeywordTitle_(
+      normalizedText,
+      frequencies
+    );
+  }
+
+  const rankedSentences = sentences
+    .map(function(sentence, index) {
+      return {
+        sentence: sentence,
+        index: index,
+        score: scoreSentence_(
+          sentence,
+          index,
+          frequencies
+        )
+      };
+    })
+    .sort(function(first, second) {
+      return second.score - first.score;
+    });
+
+  /*
+   * Check the most important sentences for a clearly stated topic.
+   */
+  const sentencesToCheck = rankedSentences
+    .slice(0, 4)
+    .map(function(item) {
+      return item.sentence;
+    });
+
+  for (
+    let index = 0;
+    index < sentencesToCheck.length;
+    index++
+  ) {
+    const directTopic = extractDirectTopic_(
+      sentencesToCheck[index]
+    );
+
+    if (directTopic) {
+      return toTitleCase_(directTopic);
+    }
+  }
+
+  /*
+   * If no direct topic statement exists, create a key phrase
+   * from the strongest sentence.
+   */
+  const strongestSentence = rankedSentences[0].sentence;
+
+  const keyPhrase = extractKeyPhrase_(
+    strongestSentence,
+    frequencies
+  );
+
+  if (keyPhrase) {
+    return toTitleCase_(keyPhrase);
+  }
+
+  return generateKeywordTitle_(
+    normalizedText,
+    frequencies
+  );
+}
+
+
+/**
+ * Extracts a topic from phrases such as:
+ * "This essay is about a hike in Utah."
+ * "I went on a hike in Utah."
+ * "The report discusses ocean pollution."
+ */
+function extractDirectTopic_(sentence) {
+  const value = String(sentence || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const patterns = [
+    /\b(?:is|was|are|were)\s+about\s+(.+?)(?:[.!?]|$)/i,
+
+    /\b(?:discusses|explains|examines|covers|describes)\s+(.+?)(?:[.!?]|$)/i,
+
+    /\b(?:focuses|focused)\s+on\s+(.+?)(?:[.!?]|$)/i,
+
+    /\b(?:story|essay|paper|document|report|book)\s+about\s+(.+?)(?:[.!?]|$)/i,
+
+    /\b(?:went|goes|going)\s+on\s+(?:a|an|the)\s+(.+?)(?:[,;.!?]|$)/i,
+
+    /\b(?:took|completed)\s+(?:a|an|the)\s+(.+?)(?:[,;.!?]|$)/i,
+
+    /\b(?:hiked|hiking)\s+(?:in|through|across)\s+(.+?)(?:[,;.!?]|$)/i
+  ];
+
+  for (let index = 0; index < patterns.length; index++) {
+    const match = value.match(patterns[index]);
+
+    if (match && match[1]) {
+      let topic = cleanTopicPhrase_(match[1]);
+
+      /*
+       * Converts "Utah" from "hiked in Utah"
+       * into "Hike in Utah".
+       */
+      if (
+        /\b(?:hiked|hiking)\s+(?:in|through|across)\s+/i
+          .test(value) &&
+        countWords_(topic) <= 5
+      ) {
+        topic = 'Hike in ' + topic;
+      }
+
+      if (
+        countWords_(topic) >= 2 &&
+        countWords_(topic) <= 11
+      ) {
+        return topic;
+      }
+    }
+  }
+
+  return '';
+}
+
+
+/**
+ * Builds a title phrase from important words in a sentence.
+ */
+function extractKeyPhrase_(sentence, frequencies) {
+  const tokens = String(sentence || '')
+    .replace(/[“”"'()[\]{}:;!?]/g, '')
+    .replace(/[,.]+$/g, '')
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (tokens.length < 3) {
+    return '';
+  }
+
+  const importantPositions = [];
+
+  tokens.forEach(function(token, index) {
+    const normalizedWord = normalizeWord_(token);
+
+    if (
+      normalizedWord &&
+      !isStopWord_(normalizedWord) &&
+      frequencies[normalizedWord] >= 1
+    ) {
+      importantPositions.push({
+        index: index,
+        score: frequencies[normalizedWord]
+      });
+    }
+  });
+
+  importantPositions.sort(function(first, second) {
+    return second.score - first.score;
+  });
+
+  const selectedIndexes = importantPositions
+    .slice(0, 5)
+    .map(function(item) {
+      return item.index;
+    })
+    .sort(function(first, second) {
+      return first - second;
+    });
+
+  if (selectedIndexes.length < 2) {
+    return '';
+  }
+
+  let start = selectedIndexes[0];
+  let end = selectedIndexes[selectedIndexes.length - 1];
+
+  if (end - start > 10) {
+    end = Math.min(start + 9, tokens.length - 1);
+  }
+
+  let phraseTokens = tokens.slice(start, end + 1);
+
+  phraseTokens = removeWeakBeginningWords_(phraseTokens);
+  phraseTokens = removeWeakEndingWords_(phraseTokens);
+
+  const phrase = cleanTopicPhrase_(
+    phraseTokens.join(' ')
+  );
+
+  if (
+    countWords_(phrase) >= 2 &&
+    countWords_(phrase) <= 11
+  ) {
+    return phrase;
+  }
+
+  return '';
+}
+
+
+/**
+ * Expands a generated title using additional important topics.
+ *
+ * Example:
+ * "Hike in Utah"
+ *
+ * may become:
+ * "Hike in Utah: Mountain Trails, Desert Scenery, Wildlife, and Travel"
+ */
+function expandGeneratedTitle_(baseTitle, documentText) {
+  let title = cleanTitle_(baseTitle);
+
+  if (title.length >= SETTINGS.TARGET_TITLE_CHARACTERS) {
+    return limitGeneratedTitle_(title);
+  }
+
+  const frequencies = calculateWordFrequencies_(
+    documentText
+  );
+
+  const existingWords = {};
+
+  getNormalizedWords_(title).forEach(function(word) {
+    existingWords[word] = true;
+  });
+
+  const documentType = detectDocumentType_(documentText);
+  const descriptors = [];
+
+  if (
+    documentType &&
+    title.toLowerCase().indexOf(
+      documentType.toLowerCase()
+    ) === -1
+  ) {
+    descriptors.push(documentType);
+  }
+
+  const rankedWords = Object.keys(frequencies)
+    .filter(function(word) {
+      return (
+        !isStopWord_(word) &&
+        !existingWords[word] &&
+        word.length >= 4
+      );
+    })
+    .sort(function(firstWord, secondWord) {
+      return (
+        frequencies[secondWord] -
+        frequencies[firstWord]
+      );
+    });
+
+  for (
+    let index = 0;
+    index < rankedWords.length;
+    index++
+  ) {
+    const word = rankedWords[index];
+
+    if (
+      descriptors.some(function(descriptor) {
+        return descriptor
+          .toLowerCase()
+          .split(/\s+/)
+          .indexOf(word) !== -1;
+      })
+    ) {
+      continue;
+    }
+
+    const testDescriptors = descriptors.concat([
+      toTitleCase_(word)
+    ]);
+
+    const candidate =
+      title + ': ' + joinTitleDescriptors_(testDescriptors);
+
+    if (
+      candidate.length <= SETTINGS.MAX_TITLE_CHARACTERS &&
+      countWords_(candidate) <= SETTINGS.MAX_TITLE_WORDS
+    ) {
+      descriptors.push(toTitleCase_(word));
+    }
+
+    if (
+      candidate.length >= SETTINGS.TARGET_TITLE_CHARACTERS ||
+      descriptors.length >= 6
+    ) {
+      break;
+    }
+  }
+
+  if (!descriptors.length) {
+    return limitGeneratedTitle_(title);
+  }
+
+  return limitGeneratedTitle_(
+    title + ': ' + joinTitleDescriptors_(descriptors)
+  );
+}
+
+
+/**
+ * Joins title descriptors with commas and "and".
+ */
+function joinTitleDescriptors_(descriptors) {
+  if (descriptors.length === 1) {
+    return descriptors[0];
+  }
+
+  if (descriptors.length === 2) {
+    return descriptors[0] + ' and ' + descriptors[1];
+  }
+
+  return (
+    descriptors.slice(0, -1).join(', ') +
+    ', and ' +
+    descriptors[descriptors.length - 1]
+  );
+}
+
+
+/**
+ * Creates a fallback title from frequent keywords.
+ */
+function generateKeywordTitle_(text, existingFrequencies) {
+  const frequencies =
+    existingFrequencies ||
+    calculateWordFrequencies_(text);
+
+  const rankedWords = Object.keys(frequencies)
+    .filter(function(word) {
+      return (
+        !isStopWord_(word) &&
+        word.length >= 3
+      );
+    })
+    .sort(function(first, second) {
+      return frequencies[second] - frequencies[first];
+    })
+    .slice(0, 6);
+
+  if (!rankedWords.length) {
+    return 'Document Summary';
+  }
+
+  return toTitleCase_(rankedWords.join(' '));
+}
+
+
+/**
+ * Detects a general type of document.
+ */
+function detectDocumentType_(text) {
+  const lowerText = String(text || '').toLowerCase();
+
+  const categories = [
+    {
+      name: 'Travel Experience',
+      words: [
+        'trip',
+        'travel',
+        'hike',
+        'hiking',
+        'vacation',
+        'journey',
+        'trail'
+      ]
+    },
+    {
+      name: 'Meeting Notes',
+      words: [
+        'meeting',
+        'agenda',
+        'attendees',
+        'action items'
+      ]
+    },
+    {
+      name: 'Study Guide',
+      words: [
+        'study guide',
+        'exam',
+        'quiz',
+        'vocabulary'
+      ]
+    },
+    {
+      name: 'Lab Report',
+      words: [
+        'hypothesis',
+        'procedure',
+        'materials',
+        'experiment'
+      ]
+    },
+    {
+      name: 'Application',
+      words: [
+        'application',
+        'applicant',
+        'eligibility',
+        'deadline'
+      ]
+    },
+    {
+      name: 'Essay',
+      words: [
+        'thesis',
+        'introduction',
+        'conclusion',
+        'evidence'
+      ]
+    },
+    {
+      name: 'Project Plan',
+      words: [
+        'project plan',
+        'milestone',
+        'deliverable',
+        'timeline'
+      ]
+    }
+  ];
+
+  let bestCategory = '';
+  let bestScore = 0;
+
+  categories.forEach(function(category) {
+    let score = 0;
+
+    category.words.forEach(function(word) {
+      if (lowerText.indexOf(word) !== -1) {
+        score++;
+      }
+    });
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestCategory = category.name;
+    }
+  });
+
+  return bestScore >= 2 ? bestCategory : '';
+}
+
+
+/**
+ * Scores sentences according to repeated topics and position.
+ */
+function scoreSentence_(sentence, index, frequencies) {
+  const words = getNormalizedWords_(sentence);
+
+  if (!words.length) {
+    return 0;
+  }
+
+  let score = 0;
+
+  words.forEach(function(word) {
+    if (!isStopWord_(word)) {
+      score += frequencies[word] || 0;
+    }
+  });
+
+  /*
+   * Introductory sentences are more likely to state the topic.
+   */
+  if (index === 0) {
+    score += 9;
+  } else if (index < 3) {
+    score += 5;
+  }
+
+  /*
+   * Medium-length sentences are usually more useful.
+   */
+  if (words.length >= 7 && words.length <= 30) {
+    score += 5;
+  }
+
+  /*
+   * Topic-introduction wording receives extra weight.
+   */
+  if (
+    /\b(?:about|focuses on|explains|discusses|examines|describes|main idea)\b/i
+      .test(sentence)
+  ) {
+    score += 9;
+  }
+
+  return score / Math.sqrt(words.length);
+}
+
+
+/**
+ * Calculates useful word frequencies.
+ */
+function calculateWordFrequencies_(text) {
+  const words = getNormalizedWords_(text);
+  const frequencies = {};
+
+  words.forEach(function(word) {
+    if (
+      !isStopWord_(word) &&
+      word.length >= 3 &&
+      !/^\d+$/.test(word)
+    ) {
+      frequencies[word] =
+        (frequencies[word] || 0) + 1;
+    }
+  });
+
+  return frequencies;
+}
+
+
+/**
+ * Checks whether the current Drive filename is generic.
+ */
+function isGenericFileName_(fileName) {
+  const value = String(fileName || '')
+    .toLowerCase()
+    .replace(/^copy of\s+/i, '')
+    .trim();
+
+  const genericPatterns = [
+    /^untitled document(?:\s*\(\d+\)|\s+\d+)?$/,
+    /^untitled(?:\s*\(\d+\)|\s+\d+)?$/,
+    /^document(?:\s*\(\d+\)|\s+\d+)?$/,
+    /^new document$/,
+    /^notes$/,
+    /^class notes$/,
+    /^homework$/,
+    /^assignment$/,
+    /^essay$/,
+    /^draft$/,
+    /^google doc$/,
+    /^doc$/
+  ];
+
+  return genericPatterns.some(function(pattern) {
+    return pattern.test(value);
+  });
+}
+
+
+/**
+ * Checks whether text inside the document is too generic.
+ */
+function isGenericText_(text) {
+  const value = String(text || '')
+    .toLowerCase()
+    .replace(/[.:]+$/g, '')
+    .trim();
+
+  const patterns = [
+    /^untitled/,
+    /^document$/,
+    /^notes$/,
+    /^class notes$/,
+    /^homework$/,
+    /^assignment$/,
+    /^essay$/,
+    /^draft$/,
+    /^introduction$/,
+    /^table of contents$/,
+    /^name$/,
+    /^date$/,
+    /^period$/,
+    /^question$/
+  ];
+
+  return patterns.some(function(pattern) {
+    return pattern.test(value);
+  });
+}
+
+
+/**
+ * Rejects names, dates, and similar information as titles.
+ */
+function looksLikePersonalInformation_(text) {
+  const value = String(text || '').trim();
+
+  return (
+    /^(name|student|teacher|class|course|period|date|email)\s*:/i
+      .test(value) ||
+    /^[\w.+-]+@[\w.-]+\.[a-z]{2,}$/i.test(value) ||
+    /^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/.test(value)
+  );
+}
+
+
+/**
+ * Rejects questions and assignment instructions as titles.
+ */
+function looksLikeQuestionOrInstruction_(text) {
+  const value = String(text || '').trim();
+
+  return (
+    /\?$/.test(value) ||
+    /^(write|explain|describe|answer|complete|discuss|identify|compare|analyze|define|solve)\b/i
+      .test(value)
+  );
+}
+
+
+/**
+ * Cleans a topic extracted from a sentence.
+ */
+function cleanTopicPhrase_(phrase) {
+  let value = String(phrase || '')
+    .replace(/\b(?:because|which|while|when|although)\b.*$/i, '')
+    .replace(/^[,;:\-\s]+/, '')
+    .replace(/[,;:.!?\-\s]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  value = value.replace(
+    /^(the topic of|the subject of|how|why)\s+/i,
+    ''
+  );
+
+  return shortenTitlePhrase_(value, 11);
+}
+
+
+/**
+ * Removes weak words from the beginning of a phrase.
+ */
+function removeWeakBeginningWords_(tokens) {
+  const weakWords = {
+    this: true,
+    that: true,
+    these: true,
+    those: true,
+    there: true,
+    here: true,
+    document: true,
+    essay: true,
+    paper: true,
+    report: true,
+    story: true,
+    discusses: true,
+    explains: true,
+    describes: true
+  };
+
+  const result = tokens.slice();
+
+  while (
+    result.length > 2 &&
+    weakWords[normalizeWord_(result[0])]
+  ) {
+    result.shift();
+  }
+
+  return result;
+}
+
+
+/**
+ * Removes weak words from the end of a phrase.
+ */
+function removeWeakEndingWords_(tokens) {
+  const result = tokens.slice();
+
+  while (
+    result.length > 2 &&
+    isWeakEndingWord_(
+      normalizeWord_(result[result.length - 1])
+    )
+  ) {
+    result.pop();
+  }
+
+  return result;
+}
+
+
+/**
+ * Cleans a proposed filename.
+ */
+function cleanTitle_(title) {
+  let value = String(title || '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/[.!?;,:\-\s]+$/g, '')
+    .trim();
+
+  if (!value) {
+    throw new Error('The script generated an empty title.');
+  }
+
+  value = shortenTitlePhrase_(
+    value,
+    SETTINGS.MAX_TITLE_WORDS
+  );
+
+  return limitGeneratedTitle_(value);
+}
+
+
+/**
+ * Preserves an existing title found inside the document.
+ */
+function formatExistingTitle_(title) {
+  const cleanedTitle = cleanTitle_(title);
+
+  /*
+   * Preserve intentionally uppercase titles.
+   */
+  if (
+    cleanedTitle === cleanedTitle.toUpperCase() &&
+    cleanedTitle.length > 3
+  ) {
+    return cleanedTitle;
+  }
+
+  return toTitleCase_(cleanedTitle);
+}
+
+
+/**
+ * Limits a generated title by word count and character count.
+ */
+function limitGeneratedTitle_(title) {
+  let words = String(title || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (words.length > SETTINGS.MAX_TITLE_WORDS) {
+    words = words.slice(0, SETTINGS.MAX_TITLE_WORDS);
+  }
+
+  words = removeWeakEndingWords_(words);
+
+  let result = words.join(' ');
+
+  if (result.length > SETTINGS.MAX_TITLE_CHARACTERS) {
+    result = result
+      .slice(0, SETTINGS.MAX_TITLE_CHARACTERS)
+      .replace(/\s+\S*$/, '')
+      .replace(/[,;:\-\s]+$/, '')
+      .trim();
+  }
+
+  return result;
+}
+
+
+/**
+ * Limits a phrase to a maximum number of words.
+ */
+function shortenTitlePhrase_(text, maximumWords) {
+  let words = String(text || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (words.length > maximumWords) {
+    words = words.slice(0, maximumWords);
+  }
+
+  words = removeWeakEndingWords_(words);
+
+  return words.join(' ');
+}
+
+
+/**
+ * Converts text into title case.
+ */
+function toTitleCase_(text) {
+  const smallWords = {
+    a: true,
+    an: true,
+    and: true,
+    as: true,
+    at: true,
+    but: true,
+    by: true,
+    for: true,
+    from: true,
+    in: true,
+    nor: true,
+    of: true,
+    on: true,
+    or: true,
+    the: true,
+    to: true,
+    with: true
+  };
+
+  const words = String(text || '')
+    .toLowerCase()
+    .split(/\s+/);
+
+  return words
+    .map(function(word, index) {
+      if (
+        index > 0 &&
+        index < words.length - 1 &&
+        smallWords[word]
+      ) {
+        return word;
+      }
+
+      return word.charAt(0).toUpperCase() +
+        word.slice(1);
+    })
+    .join(' ');
+}
+
+
+/**
+ * Splits document text into sentences.
+ */
+function splitIntoSentences_(text) {
+  const matches = String(text || '').match(
+    /[^.!?]+[.!?]+|[^.!?]+$/g
+  );
+
+  if (!matches) {
+    return [];
+  }
+
+  return matches
+    .map(function(sentence) {
+      return sentence
+        .replace(/\s+/g, ' ')
+        .trim();
+    })
+    .filter(function(sentence) {
+      const words = countWords_(sentence);
+
+      return (
+        sentence.length >= 15 &&
+        words >= 3 &&
+        words <= 70
+      );
+    });
+}
+
+
+/**
+ * Returns normalized words from text.
+ */
+function getNormalizedWords_(text) {
+  const matches = String(text || '')
+    .toLowerCase()
+    .match(/[a-z][a-z'-]*/g);
+
+  if (!matches) {
+    return [];
+  }
+
+  return matches
+    .map(normalizeWord_)
+    .filter(Boolean);
+}
+
+
+/**
+ * Normalizes one word.
+ */
+function normalizeWord_(word) {
+  return String(word || '')
+    .toLowerCase()
+    .replace(/^[^a-z]+|[^a-z]+$/g, '')
+    .replace(/'s$/g, '');
+}
+
+
+/**
+ * Removes repeated spaces from text.
+ */
+function normalizeText_(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+
+/**
+ * Counts the words inside text.
+ */
+function countWords_(text) {
+  const matches = String(text || '')
+    .match(/\b[\w'-]+\b/g);
+
+  return matches ? matches.length : 0;
+}
+
+
+/**
+ * Shortens summary text without cutting through a word.
+ */
+function shortenText_(text, maximumLength) {
+  const value = String(text || '').trim();
+
+  if (value.length <= maximumLength) {
+    return value;
+  }
+
+  return value
+    .slice(0, maximumLength)
+    .replace(/\s+\S*$/, '')
+    .trim() + '…';
+}
+
+
+/**
+ * Checks whether a word is weak at the end of a title.
+ */
+function isWeakEndingWord_(word) {
+  const weakWords = {
+    a: true,
+    an: true,
+    and: true,
+    as: true,
+    at: true,
+    by: true,
+    for: true,
+    from: true,
+    in: true,
+    of: true,
+    on: true,
+    or: true,
+    the: true,
+    to: true,
+    with: true
+  };
+
+  return Boolean(weakWords[word]);
+}
+
+
+/**
+ * Checks whether a word is too common to identify the topic.
+ */
+function isStopWord_(word) {
+  const stopWords = {
+    a: true,
+    about: true,
+    after: true,
+    again: true,
+    against: true,
+    all: true,
+    also: true,
+    am: true,
+    an: true,
+    and: true,
+    any: true,
+    are: true,
+    as: true,
+    at: true,
+    be: true,
+    because: true,
+    been: true,
+    before: true,
+    being: true,
+    between: true,
+    both: true,
+    but: true,
+    by: true,
+    can: true,
+    could: true,
+    did: true,
+    do: true,
+    does: true,
+    doing: true,
+    during: true,
+    each: true,
+    for: true,
+    from: true,
+    further: true,
+    had: true,
+    has: true,
+    have: true,
+    having: true,
+    he: true,
+    her: true,
+    here: true,
+    hers: true,
+    herself: true,
+    him: true,
+    himself: true,
+    his: true,
+    how: true,
+    i: true,
+    if: true,
+    in: true,
+    into: true,
+    is: true,
+    it: true,
+    its: true,
+    itself: true,
+    just: true,
+    me: true,
+    more: true,
+    most: true,
+    my: true,
+    myself: true,
+    no: true,
+    nor: true,
+    not: true,
+    now: true,
+    of: true,
+    on: true,
+    once: true,
+    only: true,
+    or: true,
+    other: true,
+    our: true,
+    ours: true,
+    ourselves: true,
+    out: true,
+    over: true,
+    own: true,
+    same: true,
+    she: true,
+    should: true,
+    so: true,
+    some: true,
+    such: true,
+    than: true,
+    that: true,
+    the: true,
+    their: true,
+    theirs: true,
+    them: true,
+    themselves: true,
+    then: true,
+    there: true,
+    these: true,
+    they: true,
+    this: true,
+    those: true,
+    through: true,
+    to: true,
+    too: true,
+    under: true,
+    until: true,
+    up: true,
+    very: true,
+    was: true,
+    we: true,
+    were: true,
+    what: true,
+    when: true,
+    where: true,
+    which: true,
+    while: true,
+    who: true,
+    whom: true,
+    why: true,
+    will: true,
+    with: true,
+    would: true,
+    you: true,
+    your: true,
+    yours: true,
+    yourself: true,
+    yourselves: true
+  };
+
+  return Boolean(stopWords[word]);
+}
+
+
+/**
+ * Extracts the folder ID from a Google Drive folder URL.
+ */
+function extractFolderId_(folderUrlOrId) {
+  const input = String(folderUrlOrId || '').trim();
+
+  if (
+    !input ||
+    input === 'PASTE_YOUR_GOOGLE_DRIVE_FOLDER_URL_HERE'
+  ) {
+    throw new Error(
+      'Paste your Google Drive folder URL into SETTINGS.FOLDER_URL.'
+    );
+  }
+
+  const folderMatch = input.match(
+    /\/folders\/([a-zA-Z0-9_-]+)/
+  );
+
+  const folderId = folderMatch ?
+    folderMatch[1] :
+    input;
+
+  if (!/^[a-zA-Z0-9_-]{10,}$/.test(folderId)) {
+    throw new Error(
+      'The Google Drive folder URL or folder ID is invalid.'
+    );
+  }
+
+  return folderId;
+}
